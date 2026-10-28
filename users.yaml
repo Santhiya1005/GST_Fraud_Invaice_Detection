@@ -1,0 +1,13 @@
+
+cookie:
+  expiry_days: 1
+  key: "PASTE_YOUR_GENERATED_SECRET_HERE"
+  name: "gst_invoice_session"
+
+credentials:
+  usernames:
+    admin:
+      email: "admin@example.com"
+      first_name: "Project"
+      last_name: "Admin"
+      password: "$2b$12$6QkttZNv8nTBaq3qLEHGHujh8qvEHecRTLxgVeALBoczgAdXOPbA."
