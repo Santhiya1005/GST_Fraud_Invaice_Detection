@@ -550,151 +550,127 @@ dashboard_tab, single_tab, upload_tab, about_tab = st.tabs(
 with dashboard_tab:
     st.subheader("Previously Analyzed Invoices")
 
-    if not DATA_FILE.exists():
-        st.info(
-            "fraud_results.csv was not found. "
-            "Use the other tabs to check new invoices."
-        )
-    else:
+    # Prefer the most recently uploaded/analyzed invoices in this browser session.
+    # If none are available, fall back to the historical results CSV (if present).
+    session_results = st.session_state.get("batch_results")
+    if isinstance(session_results, pd.DataFrame) and not session_results.empty:
+        old_df = session_results.copy()
+        st.success("Showing the latest Excel/CSV analysis from this session.")
+    elif DATA_FILE.exists():
         try:
             old_df = pd.read_csv(DATA_FILE, low_memory=False)
-            old_df = normalize_columns(old_df)
-
-            if old_df.empty:
-                st.info("The results file is empty.")
-            else:
-                score_col = find_column(
-                    old_df,
-                    "fraud_risk_score",
-                    "risk_score",
-                    "wfrs_score",
-                    "wfrs",
-                )
-
-                risk_col = find_column(
-                    old_df, "risk_category", "risk_level", "risk_class"
-                )
-
-                id_col = find_column(
-                    old_df, "invoice_id", "invoice_number", "invoice_no"
-                )
-
-                amount_col = find_column(
-                    old_df, "total_amount", "invoice_amount", "amount"
-                )
-
-                if score_col:
-                    old_df["_score"] = pd.to_numeric(
-                        old_df[score_col], errors="coerce"
-                    )
-                else:
-                    old_df["_score"] = np.nan
-
-                if risk_col:
-                    old_df["_risk"] = (
-                        old_df[risk_col].fillna("UNKNOWN").astype(str).str.upper()
-                    )
-                else:
-                    old_df["_risk"] = pd.cut(
-                        old_df["_score"],
-                        bins=[-np.inf, 30, 60, np.inf],
-                        labels=["LOW", "MEDIUM", "HIGH"],
-                    ).astype("string").fillna("UNKNOWN")
-
-                if id_col:
-                    old_df["_id"] = old_df[id_col].astype(str)
-                else:
-                    old_df["_id"] = old_df.index.astype(str)
-
-                if amount_col:
-                    old_df["_amount"] = pd.to_numeric(
-                        old_df[amount_col], errors="coerce"
-                    )
-                else:
-                    old_df["_amount"] = np.nan
-
-                available_risks = sorted(old_df["_risk"].unique())
-
-                selected_risks = st.multiselect(
-                    "Filter risk category",
-                    available_risks,
-                    default=available_risks,
-                    key="dashboard_risks",
-                )
-
-                search = st.text_input(
-                    "Search invoice number", key="dashboard_search"
-                )
-
-                view = old_df[
-                    old_df["_risk"].isin(selected_risks)
-                ].copy()
-
-                if search:
-                    view = view[
-                        view["_id"].str.contains(
-                            search, case=False, na=False
-                        )
-                    ]
-
-                total = len(view)
-                high = int(
-                    view["_risk"].isin(["HIGH", "CRITICAL"]).sum()
-                )
-                medium = int((view["_risk"] == "MEDIUM").sum())
-                low = int((view["_risk"] == "LOW").sum())
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Invoices", f"{total:,}")
-                c2.metric("High Risk", f"{high:,}")
-                c3.metric("Medium Risk", f"{medium:,}")
-                c4.metric("Low Risk", f"{low:,}")
-
-                left, right = st.columns(2)
-
-                with left:
-                    st.markdown("#### Risk Category Distribution")
-                    st.bar_chart(view["_risk"].value_counts())
-
-                with right:
-                    st.markdown("#### Highest Risk Scores")
-                    if view["_score"].notna().any():
-                        st.bar_chart(
-                            view["_score"].dropna().value_counts(bins=10).sort_index()
-                        )
-                    else:
-                        st.info("No risk score column was found.")
-
-                st.markdown("#### Invoice Results")
-
-                display_cols = [
-                    "_id", "_amount", "_score", "_risk"
-                ]
-
-                st.dataframe(
-                    view[display_cols].rename(
-                        columns={
-                            "_id": "Invoice ID",
-                            "_amount": "Invoice Amount",
-                            "_score": "Risk Score",
-                            "_risk": "Risk Category",
-                        }
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-                st.download_button(
-                    "Download Filtered Results",
-                    data=view.to_csv(index=False).encode("utf-8"),
-                    file_name="filtered_fraud_results.csv",
-                    mime="text/csv",
-                    key="download_old_results",
-                )
-
         except Exception as error:
             st.error("Unable to load fraud_results.csv.")
             st.code(str(error))
+            old_df = pd.DataFrame()
+    else:
+        old_df = pd.DataFrame()
+
+    if old_df.empty:
+        st.info(
+            "No analyzed invoices are available yet. Open the Upload Excel / CSV tab, "
+            "upload your invoice file, and click Analyze Uploaded Invoices. "
+            "The results will then appear here."
+        )
+    else:
+        old_df = normalize_columns(old_df)
+
+        score_col = find_column(
+            old_df, "fraud_risk_score", "risk_score", "wfrs_score", "wfrs"
+        )
+        risk_col = find_column(
+            old_df, "risk_category", "risk_level", "risk_class"
+        )
+        id_col = find_column(
+            old_df, "invoice_id", "invoice_number", "invoice_no"
+        )
+        amount_col = find_column(
+            old_df, "total_amount", "invoice_amount", "amount"
+        )
+        reason_col = find_column(
+            old_df, "risk_reason", "suspicious_reason", "reasons", "explanation"
+        )
+
+        old_df["_score"] = (
+            pd.to_numeric(old_df[score_col], errors="coerce")
+            if score_col else np.nan
+        )
+        if risk_col:
+            old_df["_risk"] = old_df[risk_col].fillna("UNKNOWN").astype(str).str.upper()
+        else:
+            old_df["_risk"] = pd.cut(
+                old_df["_score"],
+                bins=[-np.inf, 30, 60, np.inf],
+                labels=["LOW", "MEDIUM", "HIGH"],
+            ).astype("string").fillna("UNKNOWN")
+
+        old_df["_id"] = (
+            old_df[id_col].astype(str) if id_col else old_df.index.astype(str)
+        )
+        old_df["_amount"] = (
+            pd.to_numeric(old_df[amount_col], errors="coerce")
+            if amount_col else np.nan
+        )
+
+        available_risks = sorted(old_df["_risk"].dropna().unique().tolist())
+        selected_risks = st.multiselect(
+            "Filter risk category",
+            available_risks,
+            default=available_risks,
+            key="dashboard_risks",
+        )
+        search = st.text_input("Search invoice number", key="dashboard_search")
+
+        view = old_df[old_df["_risk"].isin(selected_risks)].copy()
+        if search:
+            view = view[view["_id"].str.contains(search, case=False, na=False)]
+
+        total = len(view)
+        high = int(view["_risk"].isin(["HIGH", "CRITICAL"]).sum())
+        medium = int((view["_risk"] == "MEDIUM").sum())
+        low = int((view["_risk"] == "LOW").sum())
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Invoices", f"{total:,}")
+        c2.metric("High Risk", f"{high:,}")
+        c3.metric("Medium Risk", f"{medium:,}")
+        c4.metric("Low Risk", f"{low:,}")
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Risk Category Distribution")
+            st.bar_chart(view["_risk"].value_counts())
+        with right:
+            st.markdown("#### Risk Score Distribution")
+            if view["_score"].notna().any():
+                st.bar_chart(view["_score"].dropna().value_counts(bins=10).sort_index())
+            else:
+                st.info("No risk score column was found.")
+
+        st.markdown("#### Invoice Results")
+        display_cols = ["_id", "_amount", "_score", "_risk"]
+        rename_cols = {
+            "_id": "Invoice ID",
+            "_amount": "Invoice Amount",
+            "_score": "Risk Score",
+            "_risk": "Risk Category",
+        }
+        if reason_col:
+            display_cols.append(reason_col)
+            rename_cols[reason_col] = "Suspicious Reasons"
+
+        st.dataframe(
+            view[display_cols].rename(columns=rename_cols),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download Filtered Results",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name="filtered_fraud_results.csv",
+            mime="text/csv",
+            key="download_dashboard_results",
+        )
 
 
 # =========================================================
@@ -950,6 +926,8 @@ with upload_tab:
                         )
 
                     st.session_state["batch_results"] = batch_results
+                    # Refresh the app so the Existing Dashboard tab can show these results.
+                    st.rerun()
 
         except Exception as error:
             st.error("Could not read or analyze the uploaded file.")
