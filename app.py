@@ -8,6 +8,99 @@ import streamlit as st
 import yaml
 from yaml.loader import SafeLoader
 
+import json
+import uuid
+from supabase import create_client
+
+@st.cache_resource
+def get_supabase_client():
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_SECRET_KEY"],
+    )
+
+
+def save_analysis_results(results_df, batch_id):
+    """Save analysis results under the currently logged-in username."""
+    username = st.session_state.get("username")
+
+    if not username:
+        raise ValueError(
+            "Logged-in username was not found. "
+            "Cannot safely associate records with a user."
+        )
+
+    client = get_supabase_client()
+
+    # Convert pandas/numpy values to JSON-compatible Python values.
+    records = json.loads(
+        results_df.to_json(orient="records", date_format="iso")
+    )
+
+    rows = []
+
+    for record in records:
+        rows.append({
+            "username": str(username),
+            "batch_id": batch_id,
+            "invoice_id": str(
+                record.get("invoice_id", record.get("invoice_number", ""))
+            ),
+            "invoice_data": record,
+            "risk_score": record.get(
+                "fraud_risk_score", record.get("risk_score")
+            ),
+            "risk_level": record.get(
+                "risk_category", record.get("risk_level")
+            ),
+            "is_anomaly": bool(record.get("is_anomaly", False)),
+            "risk_reason": str(
+                record.get("risk_reason", record.get("suspicious_reasons", ""))
+            ),
+        })
+
+    # Insert in smaller chunks for larger Excel files.
+    # An empty dataframe should not trigger a database request.
+    for start in range(0, len(rows), 500):
+        client.table("invoice_analyses").insert(
+            rows[start:start + 500]
+        ).execute()
+
+
+def load_saved_analyses(limit=1000):
+    """Load the current user's saved analyses from Supabase."""
+    username = st.session_state.get("username")
+    if not username:
+        return pd.DataFrame()
+
+    client = get_supabase_client()
+    response = (
+        client.table("invoice_analyses")
+        .select("invoice_id, invoice_data, risk_score, risk_level, is_anomaly, risk_reason, analyzed_at, batch_id")
+        .eq("username", str(username))
+        .order("analyzed_at", desc=True)
+        .limit(int(limit))
+        .execute()
+    )
+
+    saved_rows = []
+    for item in (response.data or []):
+        invoice_data = item.get("invoice_data") or {}
+        if not isinstance(invoice_data, dict):
+            invoice_data = {}
+        # Keep original invoice fields, while ensuring saved analysis columns exist.
+        record = dict(invoice_data)
+        record.setdefault("invoice_id", item.get("invoice_id"))
+        record.setdefault("fraud_risk_score", item.get("risk_score"))
+        record.setdefault("risk_category", item.get("risk_level"))
+        record.setdefault("is_anomaly", item.get("is_anomaly", False))
+        record.setdefault("risk_reason", item.get("risk_reason", ""))
+        record.setdefault("analyzed_at", item.get("analyzed_at"))
+        record.setdefault("batch_id", item.get("batch_id"))
+        saved_rows.append(record)
+
+    return pd.DataFrame(saved_rows)
+
 # =========================================================
 # 1. PAGE CONFIGURATION
 # =========================================================
@@ -116,15 +209,18 @@ if auth_status is None:
     st.info("Enter your username and password to continue.")
     st.stop()
 
+
 with st.sidebar:
     st.success(f"Welcome, {st.session_state.get('name', 'User')}!")
-    try:
-        authenticator.logout(location="sidebar", key="logout")
-    except Exception:
-        authenticator.logout("Logout", "sidebar", key="logout")
+
+    authenticator.logout(
+        location="sidebar",
+        key="unique_logout_button"
+    )
 
     st.divider()
     st.caption("GST Invoice Analysis Dashboard")
+
 
 # =========================================================
 # 4. HELPER FUNCTIONS
@@ -550,21 +646,31 @@ dashboard_tab, single_tab, upload_tab, about_tab = st.tabs(
 with dashboard_tab:
     st.subheader("Previously Analyzed Invoices")
 
-    # Prefer the most recently uploaded/analyzed invoices in this browser session.
-    # If none are available, fall back to the historical results CSV (if present).
+    # Prefer the latest session batch for immediate feedback. Otherwise load
+    # persistent records from Supabase, then use the local CSV as a fallback.
     session_results = st.session_state.get("batch_results")
     if isinstance(session_results, pd.DataFrame) and not session_results.empty:
         old_df = session_results.copy()
-        st.success("Showing the latest Excel/CSV analysis from this session.")
-    elif DATA_FILE.exists():
-        try:
-            old_df = pd.read_csv(DATA_FILE, low_memory=False)
-        except Exception as error:
-            st.error("Unable to load fraud_results.csv.")
-            st.code(str(error))
-            old_df = pd.DataFrame()
+        st.success("Showing the latest invoice analysis from this session.")
     else:
         old_df = pd.DataFrame()
+        try:
+            old_df = load_saved_analyses(limit=1000)
+            if not old_df.empty:
+                st.success("Showing saved invoice analyses from Supabase (latest 1,000 records).")
+        except Exception as error:
+            st.warning("Could not load saved analyses from Supabase. Trying the local CSV, if available.")
+            st.caption(str(error))
+
+        if old_df.empty and DATA_FILE.exists():
+            try:
+                old_df = pd.read_csv(DATA_FILE, low_memory=False)
+                if not old_df.empty:
+                    st.info("Showing historical results from fraud_results.csv.")
+            except Exception as error:
+                st.error("Unable to load fraud_results.csv.")
+                st.code(str(error))
+                old_df = pd.DataFrame()
 
     if old_df.empty:
         st.info(
@@ -756,7 +862,18 @@ with single_tab:
         }
 
         result = analyze_invoice(single_invoice, model=model)
+        try:
+            single_df = pd.DataFrame([{
+                **single_invoice,
+                **result,
+            }])
 
+            save_analysis_results(single_df, str(uuid.uuid4()))
+            st.session_state["batch_results"] = single_df.copy()
+            st.success("Invoice analysis saved to the database.")
+        except Exception as error:
+            st.error("Could not save this invoice to Supabase.")
+            st.error(str(error))
         st.divider()
         st.markdown("### Invoice Analysis Result")
 
@@ -926,6 +1043,15 @@ with upload_tab:
                         )
 
                     st.session_state["batch_results"] = batch_results
+                    batch_id = str(uuid.uuid4())
+
+                    try:
+                        save_analysis_results(batch_results, batch_id)
+                        st.session_state["last_saved_batch_id"] = batch_id
+                        st.success("Analysis results saved to the database.")
+                    except Exception as error:
+                        st.error("Could not save results to Supabase.")
+                        st.error(str(error))
                     # Refresh the app so the Existing Dashboard tab can show these results.
                     st.rerun()
 

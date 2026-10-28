@@ -7,6 +7,7 @@ __pycache__/
 # Virtual environments
 .venv/
 .venv_new/
+.venv_old/
 venv/
 env/
 
@@ -14,12 +15,12 @@ env/
 .env
 .env.*
 !.env.example
-.streamlit/secrets.toml
 secrets.toml
+secrets.yaml
+.streamlit/secrets.toml
 
 # Authentication credentials
 users.yaml
-secrets.yaml
 
 # Jupyter
 .ipynb_checkpoints/
@@ -42,7 +43,12 @@ htmlcov/
 # Large raw datasets
 data/raw/
 *.parquet
-# Large generated datasets and results
+
+# Generated datasets and results
 engineered_invoices.csv
 test_invoices.csv
 fraud_results.csv
+
+# Trained model files
+# Uncomment this if you do NOT want to push model files
+# *.joblib
