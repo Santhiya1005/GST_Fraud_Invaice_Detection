@@ -1,13 +1,15 @@
-
 cookie:
   expiry_days: 1
-  key: "PASTE_YOUR_GENERATED_SECRET_HERE"
-  name: "gst_invoice_session"
-
+  key: PASTE_YOUR_GENERATED_SECRET_HERE
+  name: gst_invoice_session
 credentials:
   usernames:
     admin:
-      email: "admin@example.com"
-      first_name: "Project"
-      last_name: "Admin"
-      password: "$2b$12$6QkttZNv8nTBaq3qLEHGHujh8qvEHecRTLxgVeALBoczgAdXOPbA."
+      email: admin@example.com
+      first_name: Project
+      last_name: Admin
+      password: $2b$12$6QkttZNv8nTBaq3qLEHGHujh8qvEHecRTLxgVeALBoczgAdXOPbA.
+    santhiya1005:
+      name: SANTHIYA S
+      email: santhiya.ad23@bitsathy.ac.in
+      password: $2b$12$8HGPxuDnc7MfnuG2Lum8l.JRX/uGehqoTaUNDuIv1xPlxpCF5USoS

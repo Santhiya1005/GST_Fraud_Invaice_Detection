@@ -3,13 +3,15 @@ from pathlib import Path
 from datetime import date
 import json
 import uuid
+import os
+import tempfile
 
+import bcrypt
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yaml
-from yaml.loader import SafeLoader
 
 try:
     from supabase import create_client
@@ -33,31 +35,14 @@ MODEL_FILE = BASE_DIR / "isolation_forest_model.joblib"
 RESULTS_FILE = BASE_DIR / "fraud_results.csv"
 
 FEATURE_COLUMNS = [
-    "quantity",
-    "unit_price",
-    "discount_percent",
-    "tax_percent",
-    "subtotal",
-    "discount_amount",
-    "tax_amount",
-    "shipping_cost",
-    "total_amount",
-    "payment_terms_days",
-    "payment_delay_days",
-    "subtotal_difference",
-    "discount_difference",
-    "tax_difference",
-    "total_difference",
-    "total_error_ratio",
-    "high_discount_flag",
-    "high_tax_flag",
-    "zero_tax_flag",
-    "negative_amount_flag",
-    "payment_after_due_flag",
-    "customer_frequency",
-    "vendor_frequency",
-    "product_frequency",
-    "invoice_number_frequency",
+    "quantity", "unit_price", "discount_percent", "tax_percent",
+    "subtotal", "discount_amount", "tax_amount", "shipping_cost",
+    "total_amount", "payment_terms_days", "payment_delay_days",
+    "subtotal_difference", "discount_difference", "tax_difference",
+    "total_difference", "total_error_ratio", "high_discount_flag",
+    "high_tax_flag", "zero_tax_flag", "negative_amount_flag",
+    "payment_after_due_flag", "customer_frequency", "vendor_frequency",
+    "product_frequency", "invoice_number_frequency",
 ]
 
 
@@ -116,66 +101,334 @@ st.markdown("""
 
 
 # ============================================================
-# 3. AUTHENTICATION
+# 3. REGISTRATION AND LOGIN
 # ============================================================
-if not AUTH_FILE.exists():
-    st.error("users.yaml not found. Keep it in the same folder as app.py.")
-    st.stop()
+def default_auth_config():
+    return {
+        "credentials": {"usernames": {}}
+    }
 
-try:
-    import streamlit_authenticator as stauth
 
-    with open(AUTH_FILE, "r", encoding="utf-8") as file:
-        auth_config = yaml.load(file, Loader=SafeLoader)
+def read_auth_config():
+    """Read the existing YAML user database."""
+    if not AUTH_FILE.exists():
+        return default_auth_config()
 
-    authenticator = stauth.Authenticate(
-        auth_config["credentials"],
-        auth_config["cookie"]["name"],
-        auth_config["cookie"]["key"],
-        auth_config["cookie"]["expiry_days"],
+    try:
+        with open(AUTH_FILE, "r", encoding="utf-8") as file:
+            config = yaml.safe_load(file) or {}
+
+        config.setdefault("credentials", {})
+        config["credentials"].setdefault("usernames", {})
+
+        return config
+
+    except (OSError, yaml.YAMLError):
+        st.error("Could not read users.yaml. Check its YAML format.")
+        st.stop()
+
+
+def write_auth_config(config):
+    """Write user configuration safely using a temporary file."""
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".yaml",
+            prefix="users_",
+            dir=AUTH_FILE.parent,
+            delete=False,
+        ) as temp_file:
+            yaml.safe_dump(
+                config,
+                temp_file,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+            temp_path = temp_file.name
+
+        os.replace(temp_path, AUTH_FILE)
+
+    except Exception:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+
+
+def normalize_username(username):
+    return username.strip().lower()
+
+
+def hash_password(password):
+    return bcrypt.hashpw(
+        password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+
+def verify_password(password, password_hash):
+    try:
+        return bcrypt.checkpw(
+            password.encode("utf-8"),
+            password_hash.encode("utf-8"),
+        )
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def register_user(name, username, email, password):
+    config = read_auth_config()
+    users = config["credentials"]["usernames"]
+
+    username = normalize_username(username)
+    email = email.strip().lower()
+    name = name.strip()
+
+    if not name or not username or not email or not password:
+        return False, "Please fill in every field."
+
+    if len(username) < 3:
+        return False, "Username must contain at least 3 characters."
+
+    if not all(char.isalnum() or char in "._-" for char in username):
+        return False, (
+            "Username can contain letters, numbers, dots, "
+            "underscores and hyphens only."
+        )
+
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return False, "Enter a valid email address."
+
+    if len(password) < 8:
+        return False, "Password must contain at least 8 characters."
+
+    if not any(char.isalpha() for char in password):
+        return False, "Password must contain at least one letter."
+
+    if not any(char.isdigit() for char in password):
+        return False, "Password must contain at least one number."
+
+    if username in users:
+        return False, "This username already exists. Please log in."
+
+    # Avoid allowing the same email to be registered under
+    # multiple usernames in this local user database.
+    for existing_user in users.values():
+        if str(existing_user.get("email", "")).lower() == email:
+            return False, "This email is already registered. Please log in."
+
+    users[username] = {
+        "name": name,
+        "email": email,
+        "password": hash_password(password),
+    }
+
+    try:
+        write_auth_config(config)
+    except Exception as error:
+        return False, f"Could not save your account: {error}"
+
+    return True, "Registration successful. You can now log in."
+
+
+def login_user(username, password):
+    config = read_auth_config()
+    users = config["credentials"]["usernames"]
+    username = normalize_username(username)
+
+    if username not in users:
+        return False, None, (
+            "This username was not found. Please register a new account."
+        )
+
+    user = users[username]
+    stored_hash = user.get("password", "")
+
+    if not verify_password(password, stored_hash):
+        return False, None, "Incorrect password. Please try again."
+
+    return True, {
+        "username": username,
+        "name": user.get("name", username),
+        "email": user.get("email", ""),
+    }, "Login successful."
+
+
+# Initialize session authentication state.
+if "auth_user" not in st.session_state:
+    st.session_state["auth_user"] = None
+
+if "auth_message" not in st.session_state:
+    st.session_state["auth_message"] = None
+
+if "auth_message_type" not in st.session_state:
+    st.session_state["auth_message_type"] = "info"
+
+
+# Show registration/login page until authenticated.
+if not st.session_state["auth_user"]:
+
+    if st.session_state["auth_message"]:
+        message = st.session_state["auth_message"]
+        message_type = st.session_state["auth_message_type"]
+
+        if message_type == "success":
+            st.success(message)
+        elif message_type == "error":
+            st.error(message)
+        else:
+            st.info(message)
+
+        st.session_state["auth_message"] = None
+
+    st.subheader("Welcome!")
+    st.write("Register a new account or log in to continue.")
+
+    login_tab, register_tab = st.tabs([
+        "🔐 Login",
+        "📝 Register",
+    ])
+
+    with login_tab:
+        st.markdown("### Login to your account")
+
+        with st.form("login_form"):
+            login_username = st.text_input(
+                "Username",
+                key="login_username",
+            )
+
+            login_password = st.text_input(
+                "Password",
+                type="password",
+                key="login_password",
+            )
+
+            login_submit = st.form_submit_button(
+                "Login",
+                use_container_width=True,
+            )
+
+        if login_submit:
+            if not login_username.strip() or not login_password:
+                st.error("Enter your username and password.")
+
+            else:
+                success, user, message = login_user(
+                    login_username,
+                    login_password,
+                )
+
+                if success:
+                    st.session_state["auth_user"] = user
+                    st.session_state["auth_message"] = (
+                        f"Welcome, {user['name']}!"
+                    )
+                    st.session_state["auth_message_type"] = "success"
+                    st.rerun()
+
+                else:
+                    st.error(message)
+
+                    if "not found" in message.lower():
+                        st.info(
+                            "Open the Register tab to create your account."
+                        )
+
+    with register_tab:
+        st.markdown("### Create a new account")
+
+        with st.form("register_form"):
+            register_name = st.text_input(
+                "Full Name",
+                key="register_name",
+            )
+
+            register_username = st.text_input(
+                "Choose a Username",
+                key="register_username",
+            )
+
+            register_email = st.text_input(
+                "Email Address",
+                key="register_email",
+            )
+
+            register_password = st.text_input(
+                "Create Password",
+                type="password",
+                key="register_password",
+            )
+
+            confirm_password = st.text_input(
+                "Confirm Password",
+                type="password",
+                key="confirm_password",
+            )
+
+            register_submit = st.form_submit_button(
+                "Create Account",
+                use_container_width=True,
+            )
+
+        if register_submit:
+            if register_password != confirm_password:
+                st.error("The passwords do not match.")
+
+            else:
+                success, message = register_user(
+                    register_name,
+                    register_username,
+                    register_email,
+                    register_password,
+                )
+
+                if success:
+                    st.session_state["auth_message"] = message
+                    st.session_state["auth_message_type"] = "success"
+                    st.rerun()
+                else:
+                    st.error(message)
+
+    st.divider()
+    st.caption(
+        "Your password is stored as a bcrypt hash, not as plain text. "
+        "Keep users.yaml private."
     )
 
-    authenticator.login(location="main")
-
-except Exception as error:
-    st.error("Login initialization failed. Check users.yaml and package versions.")
-    st.code(str(error))
     st.stop()
 
-if st.session_state.get("authentication_status") is False:
-    st.error("Incorrect username or password.")
-    st.stop()
 
-if st.session_state.get("authentication_status") is None:
-    st.info("Please log in to access the dashboard.")
-    st.stop()
-
-USERNAME = str(st.session_state.get("username", "")).strip()
-
-if not USERNAME:
-    st.error("Could not identify the logged-in user.")
-    st.stop()
+# Current authenticated user.
+USERNAME = st.session_state["auth_user"]["username"]
+DISPLAY_NAME = st.session_state["auth_user"]["name"]
 
 with st.sidebar:
-    st.success(f"Welcome, {st.session_state.get('name', 'User')}!")
+    st.success(f"Welcome, {DISPLAY_NAME}!")
 
-    authenticator.logout(
-        location="sidebar",
-        key="unique_logout_button",
-    )
+    st.caption(f"Username: {USERNAME}")
+
+    if st.button("Log out", use_container_width=True):
+        st.session_state["auth_user"] = None
+        st.session_state.pop("batch_results", None)
+        st.rerun()
 
     st.divider()
     st.caption("GST Invoice Analysis Dashboard")
 
 
 # ============================================================
-# 4. SUPABASE CONNECTION
+# 4. SUPABASE CONNECTION AND HISTORY
 # ============================================================
 @st.cache_resource
 def get_supabase_client():
     if create_client is None:
         raise RuntimeError(
-            "Supabase package missing. Run: "
+            "Supabase package missing. Install it with "
             "python -m pip install supabase"
         )
 
@@ -195,13 +448,13 @@ def get_supabase_client():
 
 
 def save_analysis_results(results_df, batch_id):
-    """Save analysis results for the current logged-in user."""
-
     client = get_supabase_client()
-    safe_df = results_df.copy()
 
     records = json.loads(
-        safe_df.to_json(orient="records", date_format="iso")
+        results_df.copy().to_json(
+            orient="records",
+            date_format="iso",
+        )
     )
 
     rows = []
@@ -232,8 +485,6 @@ def save_analysis_results(results_df, batch_id):
 
 
 def load_saved_analyses(limit=1000):
-    """Load the current user's saved analyses."""
-
     client = get_supabase_client()
 
     response = (
@@ -263,8 +514,6 @@ def load_saved_analyses(limit=1000):
             payload = {}
 
         record = dict(payload)
-
-        # Use database columns if the JSON data lacks these fields.
         record.setdefault("invoice_id", item.get("invoice_id"))
         record.setdefault("fraud_risk_score", item.get("risk_score"))
         record.setdefault("risk_category", item.get("risk_level"))
@@ -272,7 +521,6 @@ def load_saved_analyses(limit=1000):
         record.setdefault("risk_reason", item.get("risk_reason", ""))
         record.setdefault("analyzed_at", item.get("analyzed_at"))
         record.setdefault("batch_id", item.get("batch_id"))
-
         records.append(record)
 
     return pd.DataFrame(records)
@@ -305,24 +553,16 @@ with st.sidebar:
     else:
         st.warning("Model unavailable. Rule-based checks remain available.")
 
-    st.caption("Anomaly alerts require manual review.")
-
 
 # ============================================================
 # 6. HELPER FUNCTIONS
 # ============================================================
 def normalize_columns(df):
     result = df.copy()
-
     result.columns = [
-        str(column)
-        .strip()
-        .lower()
-        .replace(" ", "_")
-        .replace("-", "_")
+        str(column).strip().lower().replace(" ", "_").replace("-", "_")
         for column in result.columns
     ]
-
     return result
 
 
@@ -330,9 +570,7 @@ def number(value, default=0.0):
     try:
         if value is None or pd.isna(value) or str(value).strip() == "":
             return float(default)
-
         return float(value)
-
     except (ValueError, TypeError):
         return float(default)
 
@@ -342,17 +580,14 @@ def parse_date(value):
 
 
 def get_value(row, names, default=None):
-    """Return the first available non-empty field."""
     for name in names:
         value = row.get(name)
-
         if value is not None:
             try:
                 if not pd.isna(value) and str(value).strip() != "":
                     return value
             except (TypeError, ValueError):
                 return value
-
     return default
 
 
@@ -362,54 +597,32 @@ def get_value(row, names, default=None):
 def make_features(row):
     quantity = number(row.get("quantity", 1), 1)
     unit_price = number(row.get("unit_price", 0))
-
-    discount_percent = number(
-        row.get("discount_percent", 0)
-    )
-
-    tax_percent = number(
-        get_value(row, ["tax_percent", "gst_rate"], 0)
-    )
+    discount_percent = number(row.get("discount_percent", 0))
+    tax_percent = number(get_value(row, ["tax_percent", "gst_rate"], 0))
 
     calculated_subtotal = quantity * unit_price
-
     subtotal = number(
         row.get("subtotal", calculated_subtotal),
         calculated_subtotal,
     )
 
-    calculated_discount = (
-        calculated_subtotal * discount_percent / 100
-    )
-
+    calculated_discount = calculated_subtotal * discount_percent / 100
     discount_amount = number(
         row.get("discount_amount", calculated_discount),
         calculated_discount,
     )
 
-    # GST is calculated on subtotal minus discount.
-    taxable_value = subtotal - discount_amount
-    calculated_tax = taxable_value * tax_percent / 100
+    calculated_tax = (subtotal - discount_amount) * tax_percent / 100
+    tax_amount = number(row.get("tax_amount", calculated_tax), calculated_tax)
 
-    tax_amount = number(
-        row.get("tax_amount", calculated_tax),
-        calculated_tax,
-    )
-
-    shipping_cost = number(
-        row.get("shipping_cost", 0)
-    )
+    shipping_cost = number(row.get("shipping_cost", 0))
 
     calculated_total = (
         subtotal - discount_amount + tax_amount + shipping_cost
     )
 
     total_amount = number(
-        get_value(
-            row,
-            ["total_amount", "invoice_amount"],
-            calculated_total,
-        ),
+        get_value(row, ["total_amount", "invoice_amount"], calculated_total),
         calculated_total,
     )
 
@@ -417,15 +630,17 @@ def make_features(row):
     due_date = parse_date(row.get("due_date"))
     payment_date = parse_date(row.get("payment_date"))
 
-    if pd.notna(invoice_date) and pd.notna(due_date):
-        payment_terms_days = (due_date - invoice_date).days
-    else:
-        payment_terms_days = 0
+    payment_terms_days = (
+        (due_date - invoice_date).days
+        if pd.notna(invoice_date) and pd.notna(due_date)
+        else 0
+    )
 
-    if pd.notna(payment_date) and pd.notna(due_date):
-        payment_delay_days = (payment_date - due_date).days
-    else:
-        payment_delay_days = 0
+    payment_delay_days = (
+        (payment_date - due_date).days
+        if pd.notna(payment_date) and pd.notna(due_date)
+        else 0
+    )
 
     subtotal_difference = subtotal - calculated_subtotal
     discount_difference = discount_amount - calculated_discount
@@ -455,36 +670,17 @@ def make_features(row):
         "total_error_ratio": total_error_ratio,
         "high_discount_flag": int(discount_percent > 30),
         "high_tax_flag": int(tax_percent > 28),
-
-        # Zero tax is flagged only if the tax amount is non-zero.
-        "zero_tax_flag": int(
-            tax_percent == 0 and abs(tax_amount) > 0.01
-        ),
-
+        "zero_tax_flag": int(tax_percent == 0 and abs(tax_amount) > 0.01),
         "negative_amount_flag": int(
             any(value < 0 for value in [
-                quantity,
-                unit_price,
-                subtotal,
-                discount_amount,
-                tax_amount,
-                total_amount,
+                quantity, unit_price, subtotal, discount_amount,
+                tax_amount, total_amount,
             ])
         ),
-
         "payment_after_due_flag": int(payment_delay_days > 0),
-
-        # These defaults are used for new records only.
-        # Use the original training pipeline for exact model parity.
-        "customer_frequency": number(
-            row.get("customer_frequency", 1), 1
-        ),
-        "vendor_frequency": number(
-            row.get("vendor_frequency", 1), 1
-        ),
-        "product_frequency": number(
-            row.get("product_frequency", 1), 1
-        ),
+        "customer_frequency": number(row.get("customer_frequency", 1), 1),
+        "vendor_frequency": number(row.get("vendor_frequency", 1), 1),
+        "product_frequency": number(row.get("product_frequency", 1), 1),
         "invoice_number_frequency": number(
             row.get("invoice_number_frequency", 1), 1
         ),
@@ -498,21 +694,14 @@ def analyze_invoice(row, fitted_model=None):
     features = make_features(row)
     reasons = []
 
-    # Arithmetic validation
     if abs(features["subtotal_difference"]) > 0.01:
-        reasons.append(
-            "Subtotal does not match quantity multiplied by unit price."
-        )
+        reasons.append("Subtotal does not match quantity multiplied by unit price.")
 
     if abs(features["discount_difference"]) > 0.01:
-        reasons.append(
-            "Discount amount does not match the stated discount percentage."
-        )
+        reasons.append("Discount amount does not match the stated discount percentage.")
 
     if abs(features["tax_difference"]) > 0.01:
-        reasons.append(
-            "GST amount does not match the calculated GST amount."
-        )
+        reasons.append("GST amount does not match the calculated GST amount.")
 
     if abs(features["total_difference"]) > 0.01:
         reasons.append(
@@ -520,93 +709,47 @@ def analyze_invoice(row, fitted_model=None):
             "plus GST and shipping."
         )
 
-    # Configured screening rules
     if features["discount_percent"] > 30:
-        reasons.append(
-            "Discount exceeds the configured 30% review threshold."
-        )
+        reasons.append("Discount exceeds the configured 30% review threshold.")
 
     if features["tax_percent"] > 28:
-        reasons.append(
-            "Tax rate exceeds the configured 28% review threshold; "
-            "verify the applicable GST rate."
-        )
+        reasons.append("Tax rate exceeds 28%; verify the applicable GST rate.")
 
     if features["zero_tax_flag"]:
-        reasons.append(
-            "GST rate is zero but a non-zero GST amount is recorded."
-        )
+        reasons.append("GST rate is zero but a non-zero GST amount is recorded.")
 
     if features["negative_amount_flag"]:
-        reasons.append(
-            "A quantity or invoice amount is negative."
-        )
+        reasons.append("A quantity or invoice amount is negative.")
 
     if features["payment_after_due_flag"]:
-        reasons.append(
-            "Payment date is later than the due date."
-        )
+        reasons.append("Payment date is later than the due date.")
 
-    # Transparent rule-based score: 0 to 100.
-    score = 0.0
+    score = min(features["total_error_ratio"] * 100, 40)
 
-    score += min(features["total_error_ratio"] * 100, 40)
-
-    score += (
-        20 if abs(features["tax_difference"]) > 0.01 else 0
-    )
-
-    score += (
-        15 if abs(features["discount_difference"]) > 0.01 else 0
-    )
-
-    score += (
-        15 if abs(features["subtotal_difference"]) > 0.01 else 0
-    )
-
-    score += (
-        10 if features["discount_percent"] > 30 else 0
-    )
-
-    score += (
-        10 if features["tax_percent"] > 28 else 0
-    )
-
-    score += (
-        15 if features["zero_tax_flag"] else 0
-    )
-
-    score += (
-        25 if features["negative_amount_flag"] else 0
-    )
-
-    score += (
-        5 if features["payment_after_due_flag"] else 0
-    )
+    score += 20 if abs(features["tax_difference"]) > 0.01 else 0
+    score += 15 if abs(features["discount_difference"]) > 0.01 else 0
+    score += 15 if abs(features["subtotal_difference"]) > 0.01 else 0
+    score += 10 if features["discount_percent"] > 30 else 0
+    score += 10 if features["tax_percent"] > 28 else 0
+    score += 15 if features["zero_tax_flag"] else 0
+    score += 25 if features["negative_amount_flag"] else 0
+    score += 5 if features["payment_after_due_flag"] else 0
 
     anomaly = False
     model_status = "Isolation Forest unavailable; rule checks only."
 
-    # Isolation Forest prediction is independent from rule checks.
     if fitted_model is not None:
         try:
-            expected_columns = getattr(
-                fitted_model,
-                "feature_names_in_",
-                FEATURE_COLUMNS,
+            expected_columns = list(
+                getattr(fitted_model, "feature_names_in_", FEATURE_COLUMNS)
             )
-
-            expected_columns = list(expected_columns)
 
             model_input = pd.DataFrame(
                 [[features.get(column, 0) for column in expected_columns]],
                 columns=expected_columns,
             )
 
-            prediction = int(
-                fitted_model.predict(model_input)[0]
-            )
-
+            prediction = int(fitted_model.predict(model_input)[0])
             anomaly = prediction == -1
             model_status = "Isolation Forest prediction completed."
 
@@ -614,9 +757,6 @@ def analyze_invoice(row, fitted_model=None):
                 reasons.append(
                     "Isolation Forest flagged an unusual feature pattern."
                 )
-
-                # Do not automatically force every anomaly to MEDIUM.
-                # Add a limited contribution instead.
                 score += 20
 
         except Exception as error:
@@ -627,7 +767,6 @@ def analyze_invoice(row, fitted_model=None):
 
     score = round(float(np.clip(score, 0, 100)), 2)
 
-    # Classification uses the final calculated score.
     if score >= 60:
         risk_category = "HIGH"
     elif score >= 30:
@@ -651,7 +790,7 @@ def analyze_invoice(row, fitted_model=None):
 
 
 # ============================================================
-# 9. BULK ANALYSIS
+# 9. BULK ANALYSIS AND FILE READING
 # ============================================================
 def analyze_uploaded_dataframe(df, fitted_model=None):
     clean_df = normalize_columns(df)
@@ -659,30 +798,18 @@ def analyze_uploaded_dataframe(df, fitted_model=None):
 
     for index, row in clean_df.iterrows():
         record = row.to_dict()
-
-        result = analyze_invoice(
-            record,
-            fitted_model=fitted_model,
-        )
+        result = analyze_invoice(record, fitted_model=fitted_model)
 
         result["invoice_id"] = get_value(
             record,
             ["invoice_id", "invoice_number"],
             f"ROW-{index + 1}",
         )
-
         result["source_row"] = index + 2
 
-        # Keep useful source columns in the output.
         for column in [
-            "invoice_number",
-            "invoice_date",
-            "vendor_name",
-            "vendor_id",
-            "customer_name",
-            "customer_id",
-            "currency",
-            "payment_status",
+            "invoice_number", "invoice_date", "vendor_name", "vendor_id",
+            "customer_name", "customer_id", "currency", "payment_status",
         ]:
             if column in record and column not in result:
                 result[column] = record[column]
@@ -698,7 +825,10 @@ def read_uploaded_file(uploaded_file):
     if filename.endswith(".csv"):
         return pd.read_csv(uploaded_file)
 
-    if filename.endswith((".xlsx", ".xls")):
+    if filename.endswith(".xlsx"):
+        return pd.read_excel(uploaded_file, engine="openpyxl")
+
+    if filename.endswith(".xls"):
         return pd.read_excel(uploaded_file)
 
     raise ValueError("Please upload an Excel or CSV file.")
@@ -709,11 +839,7 @@ def get_risk_counts(df):
         return {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
     categories = (
-        df["risk_category"]
-        .fillna("UNKNOWN")
-        .astype(str)
-        .str.upper()
-        .str.strip()
+        df["risk_category"].fillna("UNKNOWN").astype(str).str.upper().str.strip()
     )
 
     return {
@@ -721,6 +847,14 @@ def get_risk_counts(df):
         "MEDIUM": int((categories == "MEDIUM").sum()),
         "LOW": int((categories == "LOW").sum()),
     }
+
+
+def save_results_safely(results):
+    try:
+        save_analysis_results(results, str(uuid.uuid4()))
+        return True, "Results saved to Supabase."
+    except Exception as error:
+        return False, str(error)
 
 
 # ============================================================
@@ -745,40 +879,29 @@ with dashboard_tab:
     if isinstance(session_results, pd.DataFrame) and not session_results.empty:
         display_df = session_results.copy()
         st.caption("Showing the latest analysis from this session.")
-
     else:
         display_df = pd.DataFrame()
 
         try:
             display_df = load_saved_analyses()
-
             if not display_df.empty:
                 st.success("Loaded saved analyses from Supabase.")
-
         except Exception as error:
             st.warning("Could not load Supabase history.")
             st.caption(str(error))
 
         if display_df.empty and RESULTS_FILE.exists():
             try:
-                display_df = pd.read_csv(
-                    RESULTS_FILE,
-                    low_memory=False,
-                )
+                display_df = pd.read_csv(RESULTS_FILE, low_memory=False)
                 st.info("Showing results from fraud_results.csv.")
-
             except Exception as error:
                 st.error(f"Could not read local results: {error}")
 
     if display_df.empty:
-        st.info(
-            "No saved results yet. Analyze a single invoice or upload a file."
-        )
-
+        st.info("No saved results yet. Analyze an invoice or upload a file.")
     else:
         display_df = normalize_columns(display_df)
 
-        # Map historical column names to the current names.
         if "fraud_risk_score" not in display_df.columns:
             for candidate in ["risk_score", "wfrs_score", "wfrs"]:
                 if candidate in display_df.columns:
@@ -791,17 +914,13 @@ with dashboard_tab:
                     display_df["risk_category"] = display_df[candidate]
                     break
 
-        # If old saved categories exist, keep them as saved. Do not pretend
-        # historical rows were freshly analyzed using this code.
         if "risk_category" not in display_df.columns:
             if "fraud_risk_score" in display_df.columns:
-                saved_scores = pd.to_numeric(
-                    display_df["fraud_risk_score"],
-                    errors="coerce",
+                scores = pd.to_numeric(
+                    display_df["fraud_risk_score"], errors="coerce"
                 )
-
                 display_df["risk_category"] = np.select(
-                    [saved_scores >= 60, saved_scores >= 30],
+                    [scores >= 60, scores >= 30],
                     ["HIGH", "MEDIUM"],
                     default="LOW",
                 )
@@ -826,49 +945,24 @@ with dashboard_tab:
 
         id_col = next(
             (
-                col for col in [
-                    "invoice_id",
-                    "invoice_number",
-                    "invoice_no",
-                ]
+                col for col in ["invoice_id", "invoice_number", "invoice_no"]
                 if col in display_df.columns
             ),
             None,
         )
 
-        if id_col:
-            display_df["_invoice_display"] = display_df[id_col].astype(str)
-        else:
-            display_df["_invoice_display"] = display_df.index.astype(str)
-
-        
-        available_categories = ["LOW", "MEDIUM", "HIGH"]
+        display_df["_invoice_display"] = (
+            display_df[id_col].astype(str)
+            if id_col
+            else display_df.index.astype(str)
+        )
 
         selected_categories = st.multiselect(
             "Filter risk category",
-            options=available_categories,
-            default=available_categories,
+            options=["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
+            default=["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
             key="dashboard_category_filter",
         )
-
-        filtered_df = display_df[
-            display_df["risk_category"].isin(selected_categories)
-        ].copy()
-
-        search_text = st.text_input(
-            "Search invoice ID or number",
-            key="dashboard_invoice_search_v2",
-        )
-
-        if search_text.strip():
-            filtered_df = filtered_df[
-                filtered_df["_invoice_display"].str.contains(
-                    search_text.strip(),
-                    case=False,
-                    na=False,
-                )
-            ]
-
 
         search_text = st.text_input(
             "Search invoice ID or number",
@@ -891,7 +985,6 @@ with dashboard_tab:
         counts = get_risk_counts(filtered_df)
 
         c1, c2, c3, c4 = st.columns(4)
-
         c1.metric("Total Invoices", f"{len(filtered_df):,}")
         c2.metric("High Risk", f'{counts["HIGH"]:,}')
         c3.metric("Medium Risk", f'{counts["MEDIUM"]:,}')
@@ -901,59 +994,39 @@ with dashboard_tab:
 
         with left:
             st.markdown("#### Risk Category Distribution")
-
             if not filtered_df.empty:
                 category_counts = (
                     filtered_df["risk_category"]
                     .value_counts()
-                    .reindex(
-                        ["HIGH", "MEDIUM", "LOW", "UNKNOWN"],
-                        fill_value=0,
-                    )
+                    .reindex(["HIGH", "MEDIUM", "LOW", "UNKNOWN"], fill_value=0)
                 )
-
                 st.bar_chart(category_counts[category_counts > 0])
 
-        
         with right:
             st.markdown("#### Risk Score Distribution")
-
-            valid_scores = pd.to_numeric(
-                filtered_df["_score"],
-                errors="coerce",
-            ).dropna()
+            valid_scores = filtered_df["_score"].dropna()
 
             if not valid_scores.empty:
-                # Convert interval bins into normal text labels.
-                bin_edges = [
-                    0, 10, 20, 30, 40, 50,
-                    60, 70, 80, 90, 100
+                labels = [
+                    "0-10", "11-20", "21-30", "31-40", "41-50",
+                    "51-60", "61-70", "71-80", "81-90", "91-100",
                 ]
-
-                score_labels = [
-                    "0-10", "11-20", "21-30", "31-40",
-                    "41-50", "51-60", "61-70", "71-80",
-                    "81-90", "91-100"
-                ]
-
-                scores = valid_scores.clip(0, 100)
+                edges = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
 
                 score_bins = pd.cut(
-                    scores,
-                    bins=bin_edges,
-                    labels=score_labels,
+                    valid_scores.clip(0, 100),
+                    bins=edges,
+                    labels=labels,
                     include_lowest=True,
                     right=True,
                 )
 
-                score_counts = (
+                chart_df = (
                     score_bins.value_counts(sort=False)
-                    .reindex(score_labels, fill_value=0)
+                    .reindex(labels, fill_value=0)
+                    .rename_axis("Risk Score Range")
+                    .reset_index(name="Invoice Count")
                 )
-
-                chart_df = score_counts.rename_axis(
-                    "Risk Score Range"
-                ).reset_index(name="Invoice Count")
 
                 st.bar_chart(
                     chart_df,
@@ -963,24 +1036,15 @@ with dashboard_tab:
             else:
                 st.info("No numeric risk scores are available.")
 
-
         st.markdown("#### Invoice Results")
 
         preferred_columns = [
-            "_invoice_display",
-            "total_amount",
-            "tax_amount",
-            "tax_percent",
-            "fraud_risk_score",
-            "risk_category",
-            "is_anomaly",
-            "risk_reason",
+            "_invoice_display", "total_amount", "tax_amount", "tax_percent",
+            "fraud_risk_score", "risk_category", "is_anomaly", "risk_reason",
         ]
 
         visible_columns = [
-            column
-            for column in preferred_columns
-            if column in filtered_df.columns
+            col for col in preferred_columns if col in filtered_df.columns
         ]
 
         if visible_columns:
@@ -1004,19 +1068,15 @@ with dashboard_tab:
         with st.expander("View Risk Score Diagnostics"):
             st.write("Risk category counts:")
             st.write(filtered_df["risk_category"].value_counts())
-
             st.write("Risk score statistics:")
             st.write(filtered_df["_score"].describe())
 
             diagnostic_columns = [
-                column for column in [
-                    "_invoice_display",
-                    "_score",
-                    "risk_category",
-                    "is_anomaly",
-                    "risk_reason",
+                col for col in [
+                    "_invoice_display", "_score", "risk_category",
+                    "is_anomaly", "risk_reason",
                 ]
-                if column in filtered_df.columns
+                if col in filtered_df.columns
             ]
 
             st.dataframe(
@@ -1036,76 +1096,27 @@ with single_tab:
         col1, col2, col3 = st.columns(3)
 
         with col1:
-            invoice_id = st.text_input(
-                "Invoice Number",
-                value="INV-001",
-            )
-
+            invoice_id = st.text_input("Invoice Number", value="INV-001")
             vendor_name = st.text_input("Vendor Name")
             vendor_gstin = st.text_input("Vendor GSTIN (optional)")
-
-            invoice_date = st.date_input(
-                "Invoice Date",
-                value=date.today(),
-            )
+            invoice_date = st.date_input("Invoice Date", value=date.today())
 
         with col2:
-            quantity = st.number_input(
-                "Quantity",
-                min_value=0.0,
-                value=1.0,
-            )
-
-            unit_price = st.number_input(
-                "Unit Price (₹)",
-                min_value=0.0,
-                value=1000.0,
-            )
-
+            quantity = st.number_input("Quantity", min_value=0.0, value=1.0)
+            unit_price = st.number_input("Unit Price (₹)", min_value=0.0, value=1000.0)
             discount_percent = st.number_input(
-                "Discount (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=0.0,
+                "Discount (%)", min_value=0.0, max_value=100.0, value=0.0
             )
-
             tax_percent = st.number_input(
-                "GST Rate (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=18.0,
+                "GST Rate (%)", min_value=0.0, max_value=100.0, value=18.0
             )
 
         with col3:
-            subtotal = st.number_input(
-                "Recorded Subtotal (₹)",
-                min_value=0.0,
-                value=1000.0,
-            )
-
-            discount_amount = st.number_input(
-                "Discount Amount (₹)",
-                min_value=0.0,
-                value=0.0,
-            )
-
-            tax_amount = st.number_input(
-                "GST Amount (₹)",
-                min_value=0.0,
-                value=180.0,
-            )
-
-            shipping_cost = st.number_input(
-                "Shipping Cost (₹)",
-                min_value=0.0,
-                value=0.0,
-            )
-
-            total_amount = st.number_input(
-                "Recorded Invoice Total (₹)",
-                min_value=0.0,
-                value=1180.0,
-            )
+            subtotal = st.number_input("Recorded Subtotal (₹)", min_value=0.0, value=1000.0)
+            discount_amount = st.number_input("Discount Amount (₹)", min_value=0.0, value=0.0)
+            tax_amount = st.number_input("GST Amount (₹)", min_value=0.0, value=180.0)
+            shipping_cost = st.number_input("Shipping Cost (₹)", min_value=0.0, value=0.0)
+            total_amount = st.number_input("Recorded Invoice Total (₹)", min_value=0.0, value=1180.0)
 
         submit_single = st.form_submit_button(
             "🔍 Analyze Invoice",
@@ -1130,125 +1141,79 @@ with single_tab:
             "total_amount": total_amount,
         }
 
-        result = analyze_invoice(
-            invoice,
-            fitted_model=model,
-        )
-
+        result = analyze_invoice(invoice, fitted_model=model)
         single_df = pd.DataFrame([{**invoice, **result}])
-
-        # Store fresh analysis separately from older database records.
         st.session_state["batch_results"] = single_df.copy()
 
-        try:
-            save_analysis_results(single_df, str(uuid.uuid4()))
-            st.success("Analysis saved to Supabase.")
+        success, message = save_results_safely(single_df)
 
-        except Exception as error:
-            st.warning(
-                "Analysis completed, but Supabase saving failed."
-            )
-            st.caption(str(error))
+        if success:
+            st.success(message)
+        else:
+            st.warning("Analysis completed, but Supabase saving failed.")
+            st.caption(message)
 
         st.markdown("### Analysis Result")
 
         a, b, c = st.columns(3)
-
-        a.metric(
-            "Risk Score",
-            f'{result["fraud_risk_score"]:.2f} / 100',
-        )
-
-        b.metric(
-            "Risk Category",
-            result["risk_category"],
-        )
-
+        a.metric("Risk Score", f'{result["fraud_risk_score"]:.2f} / 100')
+        b.metric("Risk Category", result["risk_category"])
         c.metric(
             "Isolation Forest",
-            (
-                "Anomaly"
-                if result["is_anomaly"]
-                else (
-                    "Not Flagged"
-                    if model is not None
-                    else "Unavailable"
-                )
-            ),
+            "Anomaly" if result["is_anomaly"]
+            else ("Not Flagged" if model is not None else "Unavailable"),
         )
 
         if result["risk_category"] == "HIGH":
             st.error("High-risk indicators found. Review this invoice.")
-
         elif result["risk_category"] == "MEDIUM":
             st.warning("Some indicators require manual verification.")
-
         else:
             st.success(
                 "No configured warnings were triggered. "
-                "This does not guarantee that the invoice is genuine."
+                "This does not guarantee the invoice is genuine."
             )
 
         st.markdown("#### Risk Explanation")
-
         for reason in result["risk_reason"].split("; "):
             st.markdown(f"- {reason}")
 
         st.caption(result["model_status"])
 
+        calculated_subtotal = quantity * unit_price
+        calculated_discount = calculated_subtotal * discount_percent / 100
+        calculated_tax = (subtotal - discount_amount) * tax_percent / 100
+        calculated_total = subtotal - discount_amount + tax_amount + shipping_cost
+
         validation = pd.DataFrame([
             {
                 "Check": "Subtotal",
-                "Calculated": quantity * unit_price,
+                "Calculated": calculated_subtotal,
                 "Recorded": subtotal,
-                "Difference": subtotal - quantity * unit_price,
+                "Difference": subtotal - calculated_subtotal,
             },
             {
                 "Check": "Discount",
-                "Calculated": quantity * unit_price * discount_percent / 100,
+                "Calculated": calculated_discount,
                 "Recorded": discount_amount,
-                "Difference": (
-                    discount_amount
-                    - quantity * unit_price * discount_percent / 100
-                ),
+                "Difference": discount_amount - calculated_discount,
             },
             {
                 "Check": "GST",
-                "Calculated": (
-                    max(subtotal - discount_amount, 0)
-                    * tax_percent / 100
-                ),
+                "Calculated": calculated_tax,
                 "Recorded": tax_amount,
-                "Difference": (
-                    tax_amount
-                    - max(subtotal - discount_amount, 0)
-                    * tax_percent / 100
-                ),
+                "Difference": tax_amount - calculated_tax,
             },
             {
                 "Check": "Invoice Total",
-                "Calculated": (
-                    subtotal - discount_amount
-                    + tax_amount + shipping_cost
-                ),
+                "Calculated": calculated_total,
                 "Recorded": total_amount,
-                "Difference": (
-                    total_amount
-                    - (
-                        subtotal - discount_amount
-                        + tax_amount + shipping_cost
-                    )
-                ),
+                "Difference": total_amount - calculated_total,
             },
         ])
 
         st.markdown("#### Arithmetic Validation")
-
-        st.dataframe(
-            validation.round(2),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(validation.round(2), use_container_width=True, hide_index=True)
 
         st.download_button(
             "Download Invoice Analysis",
@@ -1299,7 +1264,6 @@ with upload_tab:
 
             if input_df.empty:
                 st.warning("The uploaded file is empty.")
-
             else:
                 st.success(
                     f"Loaded {len(input_df):,} invoices "
@@ -1325,20 +1289,13 @@ with upload_tab:
                         )
 
                     st.session_state["batch_results"] = results
+                    success, message = save_results_safely(results)
 
-                    try:
-                        save_analysis_results(
-                            results,
-                            str(uuid.uuid4()),
-                        )
-
-                        st.success("Results saved to Supabase.")
-
-                    except Exception as error:
-                        st.warning(
-                            "Analysis completed, but Supabase saving failed."
-                        )
-                        st.caption(str(error))
+                    if success:
+                        st.success(message)
+                    else:
+                        st.warning("Analysis completed, but Supabase saving failed.")
+                        st.caption(message)
 
         except Exception as error:
             st.error("Could not read or analyze the uploaded file.")
@@ -1351,31 +1308,23 @@ with upload_tab:
         st.markdown("### Latest Analysis Results")
 
         counts = get_risk_counts(results)
-
         c1, c2, c3, c4 = st.columns(4)
-
         c1.metric("Invoices Analyzed", f"{len(results):,}")
         c2.metric("High Risk", f'{counts["HIGH"]:,}')
         c3.metric("Medium Risk", f'{counts["MEDIUM"]:,}')
         c4.metric("Low Risk", f'{counts["LOW"]:,}')
 
         st.markdown("#### Actual Risk Category Counts")
-
         st.bar_chart(pd.Series(counts, name="Invoice Count"))
 
         st.markdown("#### Risk Score Statistics")
-
         score_series = pd.to_numeric(
-            results["fraud_risk_score"],
-            errors="coerce",
+            results["fraud_risk_score"], errors="coerce"
         )
-
         st.dataframe(
             score_series.describe().to_frame("Risk Score"),
             use_container_width=True,
         )
-
-        st.markdown("#### Filter Results")
 
         selected_risks = st.multiselect(
             "Risk category",
@@ -1424,6 +1373,7 @@ with about_tab:
     st.markdown("""
     **Features**
 
+    - User registration and login.
     - Single invoice analysis.
     - Excel and CSV batch analysis.
     - Subtotal, discount, GST and total validation.
@@ -1441,9 +1391,9 @@ with about_tab:
     )
 
     st.info(
-        "For exact consistency with the original trained model, this "
-        "app's feature engineering and scoring must match the training "
-        "code in src/02_feature_engineering.py and src/03_fraud_model.py."
+        "For exact consistency with the original trained model, the "
+        "feature engineering and scoring must match the training code "
+        "in src/02_feature_engineering.py and src/03_fraud_model.py."
     )
 
 
